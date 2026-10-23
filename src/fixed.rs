@@ -1,17 +1,17 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::de::{self, Deserialize, Deserializer, Visitor};
+use serde::de::{self, Deserialize, Deserializer};
 use thiserror::Error;
 
 const SCALE: u64 = 100_000_000;
 const FRACTION_DIGITS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct Px(u64);
+pub struct Px(u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct Qty(u64);
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Qty(u64);
 
 impl Px {
     /// The price that lies `percent` of the way from `self` to `other`.
@@ -22,70 +22,60 @@ impl Px {
             Px(self.0 - (self.0 - other.0) * percent / 100)
         }
     }
+
+    pub(crate) fn midpoint(self, other: Px) -> Px {
+        Px(self.0.midpoint(other.0))
+    }
+
+    pub(crate) fn to_f64(self) -> f64 {
+        scaled_to_f64(self.0)
+    }
 }
 
 impl Qty {
     pub(crate) fn is_zero(self) -> bool {
         self.0 == 0
     }
+
+    pub(crate) fn to_f64(self) -> f64 {
+        scaled_to_f64(self.0)
+    }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum ParseDecimalError {
-    #[error("no digits before the decimal point")]
-    MissingIntegerDigits,
-    #[error("no digits after the decimal point")]
-    MissingFractionDigits,
-    #[error("more than {FRACTION_DIGITS} fraction digits")]
-    TooManyFractionDigits,
-    #[error("unexpected character {0:?}")]
-    NonDigit(char),
-    #[error("value does not fit u64 at scale 1e8")]
+#[derive(Debug, Error, PartialEq)]
+pub enum ParseDecimalError {
+    #[error("not a plain decimal with at most {FRACTION_DIGITS} fraction digits")]
+    Malformed,
+    #[error("does not fit u64 at scale 1e8")]
     Overflow,
 }
 
-fn parse_scaled(text: &str) -> Result<u64, ParseDecimalError> {
-    let (integer, fraction) = match text.split_once('.') {
-        Some((integer, fraction)) => (integer, Some(fraction)),
-        None => (text, None),
-    };
-    if integer.is_empty() {
-        return Err(ParseDecimalError::MissingIntegerDigits);
+fn parse_decimal(text: &str) -> Result<u64, ParseDecimalError> {
+    let (integer, fraction) = text.split_once('.').unwrap_or((text, "0"));
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !digits(integer) || !digits(fraction) || fraction.len() > FRACTION_DIGITS {
+        return Err(ParseDecimalError::Malformed);
     }
-    let mut value: u64 = 0;
-    for c in integer.chars() {
-        let digit =
-            c.to_digit(10).ok_or(ParseDecimalError::NonDigit(c))?;
-        value = value
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u64::from(digit)))
-            .ok_or(ParseDecimalError::Overflow)?;
+    let whole: u64 = integer.parse().map_err(|_| ParseDecimalError::Overflow)?;
+    let mut scaled_fraction: u64 = fraction.parse().expect("at most eight digits");
+    for _ in fraction.len()..FRACTION_DIGITS {
+        scaled_fraction *= 10;
     }
-    value = value
+    whole
         .checked_mul(SCALE)
-        .ok_or(ParseDecimalError::Overflow)?;
-    let Some(fraction) = fraction else {
-        return Ok(value);
-    };
-    if fraction.is_empty() {
-        return Err(ParseDecimalError::MissingFractionDigits);
-    }
-    let mut place = SCALE;
-    for (index, c) in fraction.chars().enumerate() {
-        if index >= FRACTION_DIGITS {
-            return Err(ParseDecimalError::TooManyFractionDigits);
-        }
-        let digit =
-            c.to_digit(10).ok_or(ParseDecimalError::NonDigit(c))?;
-        place /= 10;
-        value = value
-            .checked_add(u64::from(digit) * place)
-            .ok_or(ParseDecimalError::Overflow)?;
-    }
-    Ok(value)
+        .and_then(|value| value.checked_add(scaled_fraction))
+        .ok_or(ParseDecimalError::Overflow)
 }
 
-fn fmt_scaled(value: u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "prices and sizes stay far below 2^53 at scale 1e8, where the cast is exact"
+)]
+fn scaled_to_f64(raw: u64) -> f64 {
+    raw as f64 / 1e8
+}
+
+fn fmt_decimal(value: u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let integer = value / SCALE;
     let mut fraction = value % SCALE;
     if fraction == 0 {
@@ -103,7 +93,7 @@ impl FromStr for Px {
     type Err = ParseDecimalError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        parse_scaled(text).map(Px)
+        parse_decimal(text).map(Px)
     }
 }
 
@@ -111,50 +101,51 @@ impl FromStr for Qty {
     type Err = ParseDecimalError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        parse_scaled(text).map(Qty)
+        parse_decimal(text).map(Qty)
     }
 }
 
 impl fmt::Display for Px {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_scaled(self.0, f)
+        fmt_decimal(self.0, f)
     }
 }
 
 impl fmt::Display for Qty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_scaled(self.0, f)
-    }
-}
-
-struct ScaledVisitor;
-
-impl Visitor<'_> for ScaledVisitor {
-    type Value = u64;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a decimal string with at most 8 fraction digits")
-    }
-
-    fn visit_str<E: de::Error>(self, text: &str) -> Result<u64, E> {
-        parse_scaled(text).map_err(E::custom)
+        fmt_decimal(self.0, f)
     }
 }
 
 impl<'de> Deserialize<'de> for Px {
-    fn deserialize<D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self, D::Error> {
-        deserializer.deserialize_str(ScaledVisitor).map(Px)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <&str>::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
     }
 }
 
 impl<'de> Deserialize<'de> for Qty {
-    fn deserialize<D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self, D::Error> {
-        deserializer.deserialize_str(ScaledVisitor).map(Qty)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <&str>::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn px(text: &str) -> Px {
+    text.parse().expect("test literal")
+}
+
+#[cfg(test)]
+pub(crate) fn qty(text: &str) -> Qty {
+    text.parse().expect("test literal")
+}
+
+#[cfg(test)]
+pub(crate) fn level(price: &str, size: &str) -> (Px, Qty) {
+    (px(price), qty(size))
 }
 
 #[cfg(test)]
@@ -180,52 +171,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_more_than_eight_fraction_digits() {
-        assert_eq!(
-            "1.123456789".parse::<Px>(),
-            Err(ParseDecimalError::TooManyFractionDigits)
-        );
+    fn rejects_anything_but_a_plain_decimal_with_at_most_eight_fraction_digits() {
         assert_eq!("1.12345678".parse(), Ok(Px(112_345_678)));
-    }
-
-    #[test]
-    fn rejects_non_digit_characters() {
-        assert_eq!(
-            "12a.5".parse::<Px>(),
-            Err(ParseDecimalError::NonDigit('a'))
-        );
-        assert_eq!(
-            "-1".parse::<Px>(),
-            Err(ParseDecimalError::NonDigit('-'))
-        );
-        assert_eq!(
-            "1e5".parse::<Qty>(),
-            Err(ParseDecimalError::NonDigit('e'))
-        );
-        assert_eq!(
-            "1.2.3".parse::<Qty>(),
-            Err(ParseDecimalError::NonDigit('.'))
-        );
-        assert_eq!(
-            " 1".parse::<Qty>(),
-            Err(ParseDecimalError::NonDigit(' '))
-        );
-    }
-
-    #[test]
-    fn rejects_missing_digits_around_the_point() {
-        assert_eq!(
-            "".parse::<Px>(),
-            Err(ParseDecimalError::MissingIntegerDigits)
-        );
-        assert_eq!(
-            ".5".parse::<Px>(),
-            Err(ParseDecimalError::MissingIntegerDigits)
-        );
-        assert_eq!(
-            "5.".parse::<Px>(),
-            Err(ParseDecimalError::MissingFractionDigits)
-        );
+        for text in [
+            "1.123456789",
+            "12a.5",
+            "-1",
+            "+1",
+            "1e5",
+            "1.2.3",
+            " 1",
+            "",
+            ".5",
+            "5.",
+        ] {
+            assert_eq!(
+                text.parse::<Px>(),
+                Err(ParseDecimalError::Malformed),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -241,8 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn towards_moves_a_fraction_of_the_distance_in_either_direction()
-    {
+    fn towards_moves_a_fraction_of_the_distance_in_either_direction() {
         let low: Px = "100".parse().expect("valid literal");
         let high: Px = "200".parse().expect("valid literal");
         assert_eq!(low.towards(high, 10).to_string(), "110");

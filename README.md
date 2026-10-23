@@ -51,10 +51,10 @@ or 451 means a wrong symbol, path or region: that feed fails permanently and the
 with code 1, as does a panic in any task, assumed the service needs both books.
 
 Each feed publishes an immutable `BookView` through its own `ArcSwap`. The feed task is the
-only writer; the signal task holds read-only handles and always sees a complete view without
-blocking the writer. A live view carries the top `--k-levels` of each side, the last update id,
-event timestamps, latency and the band. On a gap, a resync or a lost connection the feed
-publishes an empty view with the reason at once, so a stale
+only writer. The signal task holds read-only handles and always sees a complete view without
+blocking the writer. A live view carries the top `--k-levels` of each side, the last update
+id, the time and latency of its last event, and the band. On a gap, a resync or a lost
+connection the feed publishes an empty view with the reason, so a stale
 book cannot be read by mistake, the other feed is untouched.
 
 The implementation expects a live book never to be crossed; if it happens, the view is still
@@ -77,17 +77,15 @@ score      = spread / --spread-scale-bps + (imbalance_a + imbalance_b) / 2
 
 `long` above `--threshold` (0.5), `short` below minus that, `hold(flat)` in between. Venue `a`
 is the first in `--feeds`, and the signal assumes `b` follows it: when `a` quotes above `b` and
-both books lean to the bid, `b` is expected to move up. The check against the venue timestamp
-complements the local age: a view received a moment ago can still describe an old market state
-if the stream was delayed. It assumes the local clock is within a second of the venue clocks.
+both books lean to the bid, `b` is expected to move up. The latency check complements the
+local age: a view received a moment ago can still describe an old market state if the stream
+was delayed. It assumes the local clock is within a second of the venue clocks.
 
-A line goes to stdout when the verdict changes and at least every `--signal-heartbeat-s` (5):
+A line goes to stdout when the verdict changes and at least every `--signal-heartbeat` (5):
 
 ```
-09:07:11.248 signal hold(flat) a: binance live age=107ms latency=135ms mid=81768.15 imb=+0.512 | b: aster live age=8ms latency=18ms mid=81768.35 imb=+0.045 | spread=-0.024bps score=+0.266 e_diff=216ms
+09:07:11.248 signal hold(flat) a: binance live age=107ms latency=135ms mid=81768.15 imb=+0.512 | b: aster live age=8ms latency=18ms mid=81768.35 imb=+0.045 | spread=-0.024bps score=+0.266
 ```
-
-`e_diff` is `|E_a - E_b|`, clock offset and freshness mixed, only reported.
 
 ## Run and test
 
@@ -99,7 +97,7 @@ That runs both feeds on `BTCUSDT` until Ctrl-C; `--duration 600` stops after ten
 prints the final counters. The other flags, with defaults: `--feeds binance,aster` (the order
 defines `a` and `b`), `--k-levels 20`, `--depth-limit 1000`, `--stale-after 5`,
 `--status-interval 2`, `--reanchor-margin 10`, `--signal-interval-ms 250`,
-`--signal-heartbeat-s 5`, `--max-age-ms 1000`, `--max-latency-ms 1000`,
+`--signal-heartbeat 5`, `--max-age-ms 1000`, `--max-latency-ms 1000`,
 `--spread-scale-bps 2`, `--threshold 0.5`, `--log-format text|json`.
 
 stdout is data: a status line per feed every two seconds, the signal lines, `final` lines at

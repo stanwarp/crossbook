@@ -49,7 +49,7 @@ impl fmt::Display for ViewState {
     }
 }
 
-/// Live means exactly K levels per side, best first; not live means both sides empty.
+/// Live means exactly K levels per side, best first. Not live means both sides empty.
 pub struct BookView {
     pub feed: &'static str,
     pub state: ViewState,
@@ -57,8 +57,7 @@ pub struct BookView {
     pub asks: Vec<(Px, Qty)>,
     pub last_update_id: u64,
     pub last_event_at: Instant,
-    pub exchange_event_time_ms: u64,
-    /// Wall clock minus `E` when the last event arrived; negative means the venue clock is ahead.
+    /// Wall clock minus `E` when the last event arrived. Negative means the venue clock is ahead.
     pub latency_ms: Option<i64>,
     pub band: Option<Band>,
 }
@@ -90,7 +89,6 @@ impl BookView {
                 .collect(),
             last_update_id: book.last_update_id,
             last_event_at,
-            exchange_event_time_ms: book.event_time_ms,
             latency_ms,
             band: Some(book.band),
         }
@@ -105,7 +103,6 @@ impl BookView {
             asks: Vec::new(),
             last_update_id: 0,
             last_event_at,
-            exchange_event_time_ms: 0,
             latency_ms: None,
             band: None,
         }
@@ -127,7 +124,6 @@ mod tests {
 
     fn book() -> Book {
         let snapshot = Snapshot {
-            event_time_ms: 1_700_000_000_000,
             last_update_id: 42,
             bids: vec![level("99", "3"), level("100", "1"), level("98", "2")],
             asks: vec![level("103", "3"), level("101", "1"), level("102", "2")],
@@ -146,7 +142,6 @@ mod tests {
         assert_eq!(view.band, Some(book.band));
         assert_eq!(view.last_update_id, 42);
         assert_eq!(view.last_event_at, at);
-        assert_eq!(view.exchange_event_time_ms, 1_700_000_000_000);
         assert_eq!(view.latency_ms, Some(7));
         assert_eq!(view.crossing(), None);
     }

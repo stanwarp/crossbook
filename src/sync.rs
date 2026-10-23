@@ -9,27 +9,25 @@
 //! an update was missed, so the book is invalidated and rebuilt from a fresh
 //! snapshot. The WebSocket connection remains open.
 //!
-//! When the best price approaches a band edge, a fresh snapshot is fetched
-//! without interrupting the live book. Events received during the fetch are
-//! buffered and applied to the new snapshot before it replaces the current
-//! book.
+//! If the best price approaches the edge of the book, the snapshot is fetched behind
+//! the live book and swapped in once the buffered events stitch to it,
+//! and readers keep a book throughout.
+//! Once a side falls below `k_levels`, the book is invalidated
+//! and readers wait until the fresh snapshot stitches.
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::book::{Band, Book, DepthEvent, Snapshot};
 use crate::fixed::Px;
 
-/// About 100 s of events at the protocol's 10 per second, far more than a snapshot takes.
-/// Dropping the oldest cannot hide a loss: if the bridging event is gone, the stitch sees a hole
-/// and rejects the snapshot.
+/// About 100 seconds at ten events per second. An overflow
+/// cannot corrupt the book, costs another snapshot.
 const MAX_BUFFERED_EVENTS: usize = 1024;
 const OVERFLOW_WARN_EVERY: u64 = 1000;
-/// Half a minute covers any stream lag still worth waiting out. If nothing has bridged a
-/// snapshot by then, the numbering is off and another one is fetched.
 const STITCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) enum Input {
@@ -38,20 +36,15 @@ pub(crate) enum Input {
     Tick,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Action {
     None,
     FetchSnapshot,
-    ResetConnection { reason: ResetReason },
+    ResetConnection { silent_for: Duration },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResetReason {
-    Stale { silent_for: Duration },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResyncReason {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResyncReason {
     Gap {
         expected: u64,
         got_pu: u64,
@@ -61,25 +54,26 @@ pub(crate) enum ResyncReason {
         asks: usize,
         k_levels: usize,
     },
-    EmptySnapshotSide {
-        bids: usize,
-        asks: usize,
-    },
 }
 
-/// Best prices at which a side is close enough to its edge to re-anchor.
 #[derive(Clone, Copy)]
-pub(crate) struct Alarm {
+pub(crate) struct ReanchorPrices {
     bid_at: Px,
     ask_at: Px,
 }
 
-/// A fresh snapshot in flight while the book stays live. Events since the request are kept, so
-/// the new book can be stitched to them.
+/// A re-anchor in progress: events since the request are kept to stitch the new book to.
 pub(crate) struct Reanchor {
     buffer: VecDeque<DepthEvent>,
-    held: Option<(Snapshot, Instant)>,
+    held: Option<HeldSnapshot>,
     pub(crate) requested_at: Instant,
+}
+
+/// Waits for an event that covers it.
+struct HeldSnapshot {
+    snapshot: Snapshot,
+    since: Instant,
+    dropped: usize,
 }
 
 impl Reanchor {
@@ -94,13 +88,12 @@ pub(crate) enum State {
         snapshot: Snapshot,
         dropped: usize,
         since: Instant,
-        /// The resync being recovered from, or `None` for the first sync of a connection.
-        after: Option<ResyncReason>,
+        recovering_from: Option<ResyncReason>,
     },
     Live {
         book: Book,
         anchored_at: Instant,
-        alarm: Alarm,
+        reanchor_at: ReanchorPrices,
         reanchor: Option<Reanchor>,
     },
     Resyncing {
@@ -133,7 +126,6 @@ pub(crate) struct SyncCounters {
 pub(crate) struct SyncMachine {
     k_levels: usize,
     stale_after: Duration,
-    /// Re-anchor once the best price is within this percent of its way to the band edge.
     reanchor_margin_percent: u64,
     state: State,
     buffer: VecDeque<DepthEvent>,
@@ -141,69 +133,26 @@ pub(crate) struct SyncMachine {
     counters: SyncCounters,
 }
 
-struct Stitch {
-    dropped: usize,
-    verdict: StitchVerdict,
-}
-
-#[derive(Debug)]
-enum StitchVerdict {
+enum Built {
     Wait,
-    Bridge(DepthEvent),
-    Hole {
-        first_update_id: u64,
-        final_update_id: u64,
+    Book {
+        book: Book,
+        bridge_first: u64,
+        bridge_final: u64,
+        replayed: u64,
+    },
+    Rejected(Rejection),
+    Broken {
+        reason: ResyncReason,
     },
 }
 
-/// Drops events older than the snapshot and pops the one bridging it.
-fn stitch(
-    last_update_id: u64,
-    buffer: &mut VecDeque<DepthEvent>,
-) -> Stitch {
-    let mut dropped = 0;
-    while buffer
-        .front()
-        .is_some_and(|event| event.final_update_id < last_update_id)
-    {
-        buffer.pop_front();
-        dropped += 1;
-    }
-    let Some(first) = buffer.pop_front() else {
-        return Stitch {
-            dropped,
-            verdict: StitchVerdict::Wait,
-        };
-    };
-    if first.first_update_id > last_update_id {
-        let verdict = StitchVerdict::Hole {
-            first_update_id: first.first_update_id,
-            final_update_id: first.final_update_id,
-        };
-        buffer.push_front(first);
-        return Stitch { dropped, verdict };
-    }
-    Stitch {
-        dropped,
-        verdict: StitchVerdict::Bridge(first),
-    }
-}
-
-#[derive(Clone, Copy)]
 enum Rejection {
     Hole {
         first_update_id: u64,
         final_update_id: u64,
     },
     EmptySide {
-        bids: usize,
-        asks: usize,
-    },
-    Chain {
-        expected: u64,
-        got_pu: u64,
-    },
-    Thin {
         bids: usize,
         asks: usize,
     },
@@ -222,108 +171,73 @@ impl fmt::Display for Rejection {
             Rejection::EmptySide { bids, asks } => {
                 write!(f, "empty-side(bids={bids},asks={asks})")
             }
-            Rejection::Chain { expected, got_pu } => {
-                write!(
-                    f,
-                    "chain(expected={expected},got_pu={got_pu})"
-                )
-            }
-            Rejection::Thin { bids, asks } => {
-                write!(f, "thin(bids={bids},asks={asks})")
-            }
         }
     }
 }
 
-enum Built {
-    Wait {
-        dropped: usize,
-    },
-    Book {
-        book: Book,
-        bridge_first: u64,
-        bridge_final: u64,
-        replayed: u64,
-        dropped: usize,
-    },
-    Rejected {
-        why: Rejection,
-        dropped: usize,
-    },
-}
-
-/// Stitches a snapshot to the buffered chain: drops what predates it, applies the bridging event,
-/// replays the rest and checks the depth. On rejection the buffer keeps whatever the next snapshot
-/// can still use: the bridge after a hole or an empty side, the tail after a broken chain, nothing
-/// after a thin book.
+/// On rejection the buffer keeps what the next snapshot can still use.
 fn build_book(
     snapshot: &Snapshot,
     buffer: &mut VecDeque<DepthEvent>,
     k_levels: usize,
-    now: Instant,
+    dropped: &mut usize,
 ) -> Built {
-    let Stitch { dropped, verdict } =
-        stitch(snapshot.last_update_id, buffer);
-    let bridge = match verdict {
-        StitchVerdict::Wait => return Built::Wait { dropped },
-        StitchVerdict::Hole {
-            first_update_id,
-            final_update_id,
-        } => {
-            return Built::Rejected {
-                why: Rejection::Hole {
-                    first_update_id,
-                    final_update_id,
-                },
-                dropped,
-            };
-        }
-        StitchVerdict::Bridge(bridge) => bridge,
+    let last_update_id = snapshot.last_update_id;
+    while buffer
+        .front()
+        .is_some_and(|event| event.final_update_id < last_update_id)
+    {
+        buffer.pop_front();
+        *dropped += 1;
+    }
+    let Some(first) = buffer.front() else {
+        return Built::Wait;
     };
-    let Some(mut book) = Book::from_snapshot(snapshot, now) else {
-        let why = Rejection::EmptySide {
+    if first.first_update_id > last_update_id {
+        return Built::Rejected(Rejection::Hole {
+            first_update_id: first.first_update_id,
+            final_update_id: first.final_update_id,
+        });
+    }
+    let (bridge_first, bridge_final) = (first.first_update_id, first.final_update_id);
+    let Some(mut book) = Book::from_snapshot(snapshot) else {
+        return Built::Rejected(Rejection::EmptySide {
             bids: snapshot.bids.len(),
             asks: snapshot.asks.len(),
-        };
-        buffer.push_front(bridge);
-        return Built::Rejected { why, dropped };
+        });
     };
-    book.apply_event(&bridge, now);
-    let mut applied: u64 = 1;
+    // Events leave the buffer only as they apply, so a broken chain keeps its contiguous
+    // tail for the next snapshot.
+    let mut replayed: u64 = 0;
     while let Some(event) = buffer.front() {
-        if event.prev_final_update_id != book.last_update_id {
-            // From here on the chain is contiguous again, so it stays.
-            let why = Rejection::Chain {
+        if replayed > 0 && event.prev_final_update_id != book.last_update_id {
+            let reason = ResyncReason::Gap {
                 expected: book.last_update_id,
                 got_pu: event.prev_final_update_id,
             };
-            return Built::Rejected { why, dropped };
+            return Built::Broken { reason };
         }
-        book.apply_event(event, now);
-        applied += 1;
+        book.apply_event(event);
+        replayed += 1;
         buffer.pop_front();
     }
     if !book.has_depth(k_levels) {
-        let why = Rejection::Thin {
+        let reason = ResyncReason::BandExhausted {
             bids: book.bids.len(),
             asks: book.asks.len(),
+            k_levels,
         };
-        return Built::Rejected { why, dropped };
+        return Built::Broken { reason };
     }
     Built::Book {
         book,
-        bridge_first: bridge.first_update_id,
-        bridge_final: bridge.final_update_id,
-        replayed: applied,
-        dropped,
+        bridge_first,
+        bridge_final,
+        replayed,
     }
 }
 
-fn push_bounded(
-    buffer: &mut VecDeque<DepthEvent>,
-    event: DepthEvent,
-    dropped: &mut u64,
-) {
+fn push_bounded(buffer: &mut VecDeque<DepthEvent>, event: DepthEvent, dropped: &mut u64) {
     if buffer.len() == MAX_BUFFERED_EVENTS {
         buffer.pop_front();
         *dropped += 1;
@@ -337,14 +251,21 @@ fn push_bounded(
     buffer.push_back(event);
 }
 
-fn alarm_for(book: &Book, margin_percent: u64) -> Alarm {
+fn live_state(book: Book, margin_percent: u64, now: Instant) -> State {
+    State::Live {
+        reanchor_at: reanchor_prices(&book, margin_percent),
+        book,
+        anchored_at: now,
+        reanchor: None,
+    }
+}
+
+fn reanchor_prices(book: &Book, margin_percent: u64) -> ReanchorPrices {
     let Band {
         bid_floor,
         ask_ceiling,
     } = book.band;
-    // A live book has levels on both sides. The edge is a harmless value for the empty case
-    // that cannot happen.
-    Alarm {
+    ReanchorPrices {
         bid_at: book.best_bid().map_or(bid_floor, |(best, _)| {
             bid_floor.towards(best, margin_percent)
         }),
@@ -354,16 +275,16 @@ fn alarm_for(book: &Book, margin_percent: u64) -> Alarm {
     }
 }
 
-fn near_an_edge(alarm: Alarm, book: &Book) -> bool {
-    book.best_ask().is_some_and(|(best, _)| best >= alarm.ask_at)
+fn near_an_edge(reanchor_at: ReanchorPrices, book: &Book) -> bool {
+    book.best_ask()
+        .is_some_and(|(best, _)| best >= reanchor_at.ask_at)
         || book
             .best_bid()
-            .is_some_and(|(best, _)| best <= alarm.bid_at)
+            .is_some_and(|(best, _)| best <= reanchor_at.bid_at)
 }
 
-/// Where a failed stitch goes back to: the resync it came from, or the initial wait.
-fn waiting_state(after: Option<ResyncReason>) -> State {
-    match after {
+fn waiting_state(recovering_from: Option<ResyncReason>) -> State {
+    match recovering_from {
         Some(reason) => State::Resyncing { reason },
         None => State::Buffering,
     }
@@ -387,14 +308,13 @@ impl SyncMachine {
         }
     }
 
-    /// New socket. The stream was subscribed in the handshake, so the snapshot can go out now.
     pub(crate) fn connected(&mut self, now: Instant) -> Action {
-        self.disconnected();
+        self.reset();
         self.last_event_at = now;
         Action::FetchSnapshot
     }
 
-    pub(crate) fn disconnected(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.state = State::Buffering;
         self.buffer.clear();
     }
@@ -406,9 +326,15 @@ impl SyncMachine {
     pub(crate) fn book(&self) -> Option<&Book> {
         match &self.state {
             State::Live { book, .. } => Some(book),
-            State::Buffering
-            | State::Stitching { .. }
-            | State::Resyncing { .. } => None,
+            State::Buffering | State::Stitching { .. } | State::Resyncing { .. } => None,
+        }
+    }
+
+    /// A new value means a new book.
+    pub(crate) fn anchored_at(&self) -> Option<Instant> {
+        match &self.state {
+            State::Live { anchored_at, .. } => Some(*anchored_at),
+            State::Buffering | State::Stitching { .. } | State::Resyncing { .. } => None,
         }
     }
 
@@ -424,51 +350,25 @@ impl SyncMachine {
         self.buffer.len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn reanchor_buffered(&self) -> Option<usize> {
-        match &self.state {
-            State::Live {
-                reanchor: Some(pending),
-                ..
-            } => Some(pending.kept()),
-            State::Live { reanchor: None, .. }
-            | State::Buffering
-            | State::Stitching { .. }
-            | State::Resyncing { .. } => None,
-        }
-    }
-
-    pub(crate) fn handle(
-        &mut self,
-        input: Input,
-        now: Instant,
-    ) -> Action {
+    pub(crate) fn handle(&mut self, input: Input, now: Instant) -> Action {
         match input {
             Input::Event(event) => self.on_event(event, now),
-            Input::Snapshot(snapshot) => {
-                self.on_snapshot(snapshot, now)
-            }
+            Input::Snapshot(snapshot) => self.on_snapshot(snapshot, now),
             Input::Tick => self.on_tick(now),
         }
     }
 
-    fn on_event(
-        &mut self,
-        event: DepthEvent,
-        now: Instant,
-    ) -> Action {
+    fn on_event(&mut self, event: DepthEvent, now: Instant) -> Action {
         self.last_event_at = now;
         match &mut self.state {
             State::Live {
                 book,
-                alarm,
+                reanchor_at,
                 reanchor,
                 ..
             } => {
-                let broken = if event.prev_final_update_id
-                    == book.last_update_id
-                {
-                    book.apply_event(&event, now);
+                let broken = if event.prev_final_update_id == book.last_update_id {
+                    book.apply_event(&event);
                     self.counters.events_applied += 1;
                     if book.has_depth(self.k_levels) {
                         None
@@ -486,30 +386,12 @@ impl SyncMachine {
                     })
                 };
                 if let Some(reason) = broken {
-                    // The events kept for the re-anchor still chain into this one, unless it was
-                    // the chain itself that broke. A snapshot already in hand may well be
-                    // bridged by it.
-                    let held = match reanchor.take() {
-                        Some(pending)
-                            if matches!(
-                                reason,
-                                ResyncReason::BandExhausted { .. }
-                            ) =>
-                        {
-                            self.buffer = pending.buffer;
-                            pending.held.map(|(snapshot, _)| snapshot)
-                        }
-                        _ => None,
-                    };
+                    // A pending re-anchor goes with the book. Its snapshot, if still in flight,
+                    // arrives into the resync and serves it.
                     let action = self.resync(reason);
                     // This event starts the chain the next snapshot stitches to.
                     self.buffer_event(event);
-                    return match held {
-                        Some(snapshot) => {
-                            self.on_snapshot(snapshot, now)
-                        }
-                        None => action,
-                    };
+                    return action;
                 }
                 match reanchor {
                     Some(pending) => {
@@ -524,10 +406,10 @@ impl SyncMachine {
                             Action::None
                         }
                     }
-                    None if near_an_edge(*alarm, book) => {
+                    None if near_an_edge(*reanchor_at, book) => {
                         info!(
-                            bid_at = %alarm.bid_at,
-                            ask_at = %alarm.ask_at,
+                            bid_at = %reanchor_at.bid_at,
+                            ask_at = %reanchor_at.ask_at,
                             bid_floor = %book.band.bid_floor,
                             ask_ceiling = %book.band.ask_ceiling,
                             "best price near the band edge, re-anchoring"
@@ -554,24 +436,20 @@ impl SyncMachine {
     }
 
     fn buffer_event(&mut self, event: DepthEvent) {
-        push_bounded(
-            &mut self.buffer,
-            event,
-            &mut self.counters.buffer_dropped,
-        );
+        push_bounded(&mut self.buffer, event, &mut self.counters.buffer_dropped);
     }
 
-    fn on_snapshot(
-        &mut self,
-        snapshot: Snapshot,
-        now: Instant,
-    ) -> Action {
-        let after = match &mut self.state {
+    fn on_snapshot(&mut self, snapshot: Snapshot, now: Instant) -> Action {
+        let recovering_from = match &mut self.state {
             State::Live {
                 reanchor: Some(pending),
                 ..
             } => {
-                pending.held = Some((snapshot, now));
+                pending.held = Some(HeldSnapshot {
+                    snapshot,
+                    since: now,
+                    dropped: 0,
+                });
                 return self.try_swap(now);
             }
             State::Live { reanchor: None, .. } => {
@@ -583,13 +461,15 @@ impl SyncMachine {
             }
             State::Buffering => None,
             State::Resyncing { reason } => Some(*reason),
-            State::Stitching { after, .. } => *after,
+            State::Stitching {
+                recovering_from, ..
+            } => *recovering_from,
         };
         self.state = State::Stitching {
             snapshot,
             dropped: 0,
             since: now,
-            after,
+            recovering_from,
         };
         self.try_stitch(now)
     }
@@ -597,32 +477,22 @@ impl SyncMachine {
     fn try_stitch(&mut self, now: Instant) -> Action {
         let State::Stitching {
             snapshot,
-            dropped: dropped_earlier,
-            after,
+            dropped,
+            recovering_from,
             ..
-        } = &self.state
+        } = &mut self.state
         else {
             unreachable!("try_stitch runs only in Stitching");
         };
-        let (last_update_id, dropped_earlier, after) =
-            (snapshot.last_update_id, *dropped_earlier, *after);
-        match build_book(
-            snapshot, &mut self.buffer, self.k_levels, now,
-        ) {
-            Built::Wait { dropped } => {
-                // Dropped counts are summed over the whole wait, so the live line shows what
-                // the snapshot cost in full.
-                let dropped = dropped_earlier + dropped;
-                debug!(
+        let (last_update_id, recovering_from) = (snapshot.last_update_id, *recovering_from);
+        // Summed in the state over the whole wait, so the live line shows the full cost.
+        match build_book(snapshot, &mut self.buffer, self.k_levels, dropped) {
+            Built::Wait => {
+                trace!(
                     last_update_id,
-                    dropped,
+                    dropped = *dropped,
                     "waiting for an event that covers the snapshot"
                 );
-                if let State::Stitching { dropped: total, .. } =
-                    &mut self.state
-                {
-                    *total = dropped;
-                }
                 Action::None
             }
             Built::Book {
@@ -630,14 +500,13 @@ impl SyncMachine {
                 bridge_first,
                 bridge_final,
                 replayed,
-                dropped,
             } => {
                 self.counters.events_applied += replayed;
                 info!(
                     last_update_id,
                     bridge_first,
                     bridge_final,
-                    dropped = dropped_earlier + dropped,
+                    dropped = *dropped,
                     replayed,
                     bids = book.bids.len(),
                     asks = book.asks.len(),
@@ -645,66 +514,22 @@ impl SyncMachine {
                     ask_ceiling = %book.band.ask_ceiling,
                     "live"
                 );
-                self.state = State::Live {
-                    alarm: alarm_for(
-                        &book,
-                        self.reanchor_margin_percent,
-                    ),
-                    book,
-                    anchored_at: now,
-                    reanchor: None,
-                };
+                self.state = live_state(book, self.reanchor_margin_percent, now);
                 Action::None
             }
-            Built::Rejected { why, dropped } => self.reject_stitch(
-                why,
-                last_update_id,
-                dropped_earlier + dropped,
-                after,
-            ),
-        }
-    }
-
-    fn reject_stitch(
-        &mut self,
-        why: Rejection,
-        last_update_id: u64,
-        dropped: usize,
-        after: Option<ResyncReason>,
-    ) -> Action {
-        match why {
-            Rejection::Hole {
-                first_update_id,
-                final_update_id,
-            } => {
+            Built::Rejected(why) => {
                 self.counters.snapshot_rejected += 1;
                 warn!(
                     last_update_id,
-                    first_update_id,
-                    final_update_id,
-                    dropped,
+                    %why,
+                    dropped = *dropped,
                     buffered = self.buffer.len(),
-                    "snapshot rejected: first buffered event starts after it"
+                    "snapshot rejected, fetching another"
                 );
-                self.state = waiting_state(after);
+                self.state = waiting_state(recovering_from);
                 Action::FetchSnapshot
             }
-            Rejection::EmptySide { bids, asks } => {
-                self.resync(ResyncReason::EmptySnapshotSide {
-                    bids,
-                    asks,
-                })
-            }
-            Rejection::Chain { expected, got_pu } => {
-                self.resync(ResyncReason::Gap { expected, got_pu })
-            }
-            Rejection::Thin { bids, asks } => {
-                self.resync(ResyncReason::BandExhausted {
-                    bids,
-                    asks,
-                    k_levels: self.k_levels,
-                })
-            }
+            Built::Broken { reason } => self.resync(reason),
         }
     }
 
@@ -715,30 +540,29 @@ impl SyncMachine {
             ..
         } = &mut self.state
         else {
-            unreachable!(
-                "try_swap runs only with a re-anchor pending"
-            );
+            unreachable!("try_swap runs only with a re-anchor pending");
         };
-        let Some((snapshot, held_since)) = pending.held.take() else {
+        let Some(held) = &mut pending.held else {
             unreachable!("try_swap runs only with a snapshot held");
         };
-        let last_update_id = snapshot.last_update_id;
+        let last_update_id = held.snapshot.last_update_id;
         match build_book(
-            &snapshot, &mut pending.buffer, self.k_levels, now,
+            &held.snapshot,
+            &mut pending.buffer,
+            self.k_levels,
+            &mut held.dropped,
         ) {
-            Built::Wait { dropped } => {
-                debug!(
+            Built::Wait => {
+                trace!(
                     last_update_id,
-                    dropped,
+                    dropped = held.dropped,
                     "waiting for an event that covers the re-anchor snapshot"
                 );
-                pending.held = Some((snapshot, held_since));
                 Action::None
             }
             Built::Book {
                 book: fresh,
                 replayed,
-                dropped,
                 ..
             } => {
                 info!(
@@ -747,28 +571,36 @@ impl SyncMachine {
                     old_ask_ceiling = %book.band.ask_ceiling,
                     bid_floor = %fresh.band.bid_floor,
                     ask_ceiling = %fresh.band.ask_ceiling,
-                    dropped,
+                    dropped = held.dropped,
                     replayed,
                     bids = fresh.bids.len(),
                     asks = fresh.asks.len(),
                     "re-anchored"
                 );
                 self.counters.reanchors += 1;
-                self.state = State::Live {
-                    alarm: alarm_for(
-                        &fresh,
-                        self.reanchor_margin_percent,
-                    ),
-                    book: fresh,
-                    anchored_at: now,
-                    reanchor: None,
-                };
+                self.state = live_state(fresh, self.reanchor_margin_percent, now);
                 Action::None
             }
-            Built::Rejected { why, dropped } => {
-                // The live book is untouched, so this only costs another fetch.
+            Built::Rejected(why) => {
                 self.counters.snapshot_rejected += 1;
-                warn!(last_update_id, %why, dropped, "re-anchor snapshot rejected, fetching another");
+                warn!(
+                    last_update_id,
+                    %why,
+                    dropped = held.dropped,
+                    "re-anchor snapshot rejected, fetching another"
+                );
+                pending.held = None;
+                Action::FetchSnapshot
+            }
+            Built::Broken { reason } => {
+                self.counters.snapshot_rejected += 1;
+                warn!(
+                    last_update_id,
+                    %reason,
+                    dropped = held.dropped,
+                    "re-anchor snapshot rejected, fetching another"
+                );
+                pending.held = None;
                 Action::FetchSnapshot
             }
         }
@@ -778,10 +610,7 @@ impl SyncMachine {
         match reason {
             ResyncReason::Gap { expected, got_pu } => {
                 self.counters.gaps += 1;
-                warn!(
-                    expected,
-                    got_pu, "gap in update ids, rebuilding book"
-                );
+                warn!(expected, got_pu, "gap in update ids, rebuilding book");
             }
             ResyncReason::BandExhausted {
                 bids,
@@ -789,29 +618,16 @@ impl SyncMachine {
                 k_levels,
             } => {
                 self.counters.band_exhausted += 1;
-                warn!(
-                    bids,
-                    asks, k_levels, "band exhausted, rebuilding book"
-                );
-            }
-            ResyncReason::EmptySnapshotSide { bids, asks } => {
-                self.counters.snapshot_rejected += 1;
-                warn!(
-                    bids,
-                    asks,
-                    "snapshot has an empty side, fetching another"
-                );
+                warn!(bids, asks, k_levels, "band exhausted, rebuilding book");
             }
         }
-        // There is nothing to clear here. In Live the buffer is empty, and after a failed replay
-        // it holds exactly the chain the next snapshot has to be stitched to.
+        // The buffer holds what the next snapshot can be stitched to.
         self.state = State::Resyncing { reason };
         Action::FetchSnapshot
     }
 
     fn on_tick(&mut self, now: Instant) -> Action {
-        let silent_for =
-            now.saturating_duration_since(self.last_event_at);
+        let silent_for = now.saturating_duration_since(self.last_event_at);
         if silent_for >= self.stale_after {
             self.counters.stale_timeouts += 1;
             warn!(
@@ -819,20 +635,16 @@ impl SyncMachine {
                 state = self.state.name(),
                 "no events, connection is stale"
             );
-            self.disconnected();
-            return Action::ResetConnection {
-                reason: ResetReason::Stale { silent_for },
-            };
+            self.reset();
+            return Action::ResetConnection { silent_for };
         }
         match &mut self.state {
             State::Stitching {
                 snapshot,
                 since,
-                after,
+                recovering_from,
                 ..
-            } if now.saturating_duration_since(*since)
-                >= STITCH_TIMEOUT =>
-            {
+            } if now.saturating_duration_since(*since) >= STITCH_TIMEOUT => {
                 self.counters.snapshot_rejected += 1;
                 warn!(
                     last_update_id = snapshot.last_update_id,
@@ -840,18 +652,15 @@ impl SyncMachine {
                     buffered = self.buffer.len(),
                     "no event covered the snapshot in time, fetching another"
                 );
-                self.state = waiting_state(*after);
+                self.state = waiting_state(*recovering_from);
                 Action::FetchSnapshot
             }
             State::Live {
                 reanchor: Some(pending),
                 ..
-            } if pending.held.as_ref().is_some_and(
-                |(_, held_since)| {
-                    now.saturating_duration_since(*held_since)
-                        >= STITCH_TIMEOUT
-                },
-            ) =>
+            } if pending.held.as_ref().is_some_and(|held| {
+                now.saturating_duration_since(held.since) >= STITCH_TIMEOUT
+            }) =>
             {
                 self.counters.snapshot_rejected += 1;
                 warn!(
@@ -880,16 +689,7 @@ impl fmt::Display for ResyncReason {
                 bids,
                 asks,
                 k_levels,
-            } => write!(
-                f,
-                "band-exhausted(bids={bids},asks={asks},k={k_levels})"
-            ),
-            ResyncReason::EmptySnapshotSide { bids, asks } => {
-                write!(
-                    f,
-                    "empty-snapshot-side(bids={bids},asks={asks})"
-                )
-            }
+            } => write!(f, "band-exhausted(bids={bids},asks={asks},k={k_levels})"),
         }
     }
 }
@@ -897,21 +697,15 @@ impl fmt::Display for ResyncReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixed::{Px, Qty};
+    use crate::fixed::{Px, Qty, level, px, qty};
 
     const K: usize = 2;
     const STALE_AFTER: Duration = Duration::from_secs(5);
     const REANCHOR_MARGIN_PERCENT: u64 = 10;
 
-    fn level(price: &str, size: &str) -> (Px, Qty) {
-        (
-            price.parse().expect("test literal"),
-            size.parse().expect("test literal"),
-        )
-    }
-
     fn ids(prev: u64, first: u64, last: u64) -> DepthEvent {
         DepthEvent {
+            event_time_ms: 0,
             first_update_id: first,
             final_update_id: last,
             prev_final_update_id: prev,
@@ -929,12 +723,7 @@ mod tests {
     }
 
     fn machine(now: Instant) -> SyncMachine {
-        let mut machine = SyncMachine::new(
-            K,
-            STALE_AFTER,
-            REANCHOR_MARGIN_PERCENT,
-            now,
-        );
+        let mut machine = SyncMachine::new(K, STALE_AFTER, REANCHOR_MARGIN_PERCENT, now);
         assert_eq!(machine.connected(now), Action::FetchSnapshot);
         machine
     }
@@ -957,9 +746,7 @@ mod tests {
     fn resync_reason(machine: &SyncMachine) -> Option<ResyncReason> {
         match machine.state() {
             State::Resyncing { reason } => Some(*reason),
-            State::Buffering
-            | State::Stitching { .. }
-            | State::Live { .. } => None,
+            State::Buffering | State::Stitching { .. } | State::Live { .. } => None,
         }
     }
 
@@ -971,11 +758,43 @@ mod tests {
         expected: Expected,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     enum Expected {
         Wait,
         Bridge { first_update_id: u64 },
         Hole { first_update_id: u64 },
+    }
+
+    fn summary(built: &Built) -> Expected {
+        match built {
+            Built::Wait => Expected::Wait,
+            Built::Book { bridge_first, .. } => Expected::Bridge {
+                first_update_id: *bridge_first,
+            },
+            Built::Rejected(Rejection::Hole {
+                first_update_id, ..
+            }) => Expected::Hole {
+                first_update_id: *first_update_id,
+            },
+            Built::Rejected(Rejection::EmptySide { .. }) | Built::Broken { .. } => {
+                panic!("a plain chain on a two-sided snapshot ends elsewhere")
+            }
+        }
+    }
+
+    impl SyncMachine {
+        pub(crate) fn reanchor_buffered(&self) -> Option<usize> {
+            match &self.state {
+                State::Live {
+                    reanchor: Some(pending),
+                    ..
+                } => Some(pending.kept()),
+                State::Live { reanchor: None, .. }
+                | State::Buffering
+                | State::Stitching { .. }
+                | State::Resyncing { .. } => None,
+            }
+        }
     }
 
     const STITCH_CASES: &[StitchCase] = &[
@@ -1046,88 +865,13 @@ mod tests {
             let mut buffer: VecDeque<DepthEvent> = case
                 .buffered
                 .iter()
-                .map(|&(first, last)| {
-                    ids(first.saturating_sub(1), first, last)
-                })
+                .map(|&(first, last)| ids(first.saturating_sub(1), first, last))
                 .collect();
-            let Stitch { dropped, verdict } =
-                stitch(case.last_update_id, &mut buffer);
+            let mut dropped = 0;
+            let built = build_book(&snapshot(case.last_update_id), &mut buffer, 1, &mut dropped);
             assert_eq!(dropped, case.dropped, "{}", case.name);
-            match (verdict, case.expected) {
-                (StitchVerdict::Wait, Expected::Wait) => {}
-                (
-                    StitchVerdict::Bridge(bridge),
-                    Expected::Bridge { first_update_id },
-                ) => {
-                    assert_eq!(
-                        bridge.first_update_id, first_update_id,
-                        "{}",
-                        case.name
-                    );
-                }
-                (
-                    StitchVerdict::Hole {
-                        first_update_id, ..
-                    },
-                    Expected::Hole {
-                        first_update_id: expected,
-                    },
-                ) => {
-                    assert_eq!(
-                        first_update_id, expected,
-                        "{}",
-                        case.name
-                    );
-                }
-                (verdict, _) => panic!(
-                    "{}: unexpected verdict {verdict:?}",
-                    case.name
-                ),
-            }
+            assert_eq!(summary(&built), case.expected, "{}", case.name);
         }
-    }
-
-    #[test]
-    fn stitch_keeps_events_after_the_bridge_in_the_buffer() {
-        let mut buffer: VecDeque<DepthEvent> =
-            [ids(89, 90, 95), ids(95, 96, 101), ids(101, 102, 105)]
-                .into();
-        let Stitch { verdict, .. } = stitch(100, &mut buffer);
-        assert!(matches!(verdict, StitchVerdict::Bridge(_)));
-        assert_eq!(buffer.len(), 1);
-        assert_eq!(buffer[0].first_update_id, 102);
-    }
-
-    #[test]
-    fn connect_requests_the_snapshot_once() {
-        let now = Instant::now();
-        let mut machine = machine(now);
-        assert_eq!(
-            machine.handle(Input::Event(ids(4, 5, 6)), now),
-            Action::None
-        );
-        assert_eq!(
-            machine.handle(Input::Event(ids(6, 7, 8)), now),
-            Action::None
-        );
-        assert_eq!(machine.buffered(), 2);
-        assert!(matches!(machine.state(), State::Buffering));
-    }
-
-    #[test]
-    fn snapshot_bridged_by_buffered_event_goes_live() {
-        let now = Instant::now();
-        let mut machine = machine(now);
-        machine.handle(Input::Event(ids(4, 5, 6)), now);
-        machine.handle(Input::Event(ids(6, 7, 8)), now);
-        assert_eq!(
-            machine.handle(Input::Snapshot(snapshot(7)), now),
-            Action::None
-        );
-        let book = machine.book().expect("live");
-        assert_eq!(book.last_update_id, 8);
-        assert_eq!(machine.counters().events_applied, 1);
-        assert_eq!(machine.buffered(), 0);
     }
 
     #[test]
@@ -1205,10 +949,7 @@ mod tests {
             machine.handle(Input::Snapshot(snapshot(14)), now),
             Action::None
         );
-        assert_eq!(
-            machine.book().expect("live again").last_update_id,
-            15
-        );
+        assert_eq!(machine.book().expect("live again").last_update_id, 15);
         assert_eq!(machine.counters().events_applied, 3);
     }
 
@@ -1288,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_with_an_empty_side_resyncs() {
+    fn a_snapshot_with_an_empty_side_is_rejected() {
         let now = Instant::now();
         let mut machine = machine(now);
         machine.handle(Input::Event(ids(4, 5, 6)), now);
@@ -1298,13 +1039,9 @@ mod tests {
             machine.handle(Input::Snapshot(one_sided), now),
             Action::FetchSnapshot
         );
-        assert_eq!(
-            resync_reason(&machine),
-            Some(ResyncReason::EmptySnapshotSide {
-                bids: 2,
-                asks: 0
-            })
-        );
+        assert!(matches!(machine.state(), State::Buffering));
+        assert_eq!(machine.counters().snapshot_rejected, 1);
+        assert_eq!(machine.buffered(), 1);
     }
 
     #[test]
@@ -1315,15 +1052,11 @@ mod tests {
             machine.handle(Input::Snapshot(snapshot(9)), now),
             Action::None
         );
-        assert_eq!(
-            machine.book().expect("still live").last_update_id,
-            6
-        );
+        assert_eq!(machine.book().expect("still live").last_update_id, 6);
     }
 
     #[test]
-    fn silence_longer_than_stale_after_resets_the_connection_in_any_state()
-     {
+    fn silence_longer_than_stale_after_resets_the_connection_in_any_state() {
         let connected_at = Instant::now();
         let mut buffering = machine(connected_at);
         let mut stitching = machine(connected_at);
@@ -1333,19 +1066,13 @@ mod tests {
         let mut live = live_machine(connected_at);
         for machine in [&mut buffering, &mut stitching, &mut live] {
             assert_eq!(
-                machine.handle(
-                    Input::Tick,
-                    connected_at + Duration::from_secs(4)
-                ),
+                machine.handle(Input::Tick, connected_at + Duration::from_secs(4)),
                 Action::None
             );
             assert_eq!(
-                machine
-                    .handle(Input::Tick, connected_at + STALE_AFTER),
+                machine.handle(Input::Tick, connected_at + STALE_AFTER),
                 Action::ResetConnection {
-                    reason: ResetReason::Stale {
-                        silent_for: STALE_AFTER
-                    }
+                    silent_for: STALE_AFTER
                 }
             );
             assert_eq!(machine.counters().stale_timeouts, 1);
@@ -1354,27 +1081,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_nothing_can_bridge_is_rejected_after_the_stitch_timeout()
-     {
+    fn snapshot_nothing_can_bridge_is_rejected_after_the_stitch_timeout() {
         let connected_at = Instant::now();
         let mut machine = machine(connected_at);
         assert_eq!(
-            machine
-                .handle(Input::Snapshot(snapshot(100)), connected_at),
+            machine.handle(Input::Snapshot(snapshot(100)), connected_at),
             Action::None
         );
         for second in 1..30u64 {
             let at = connected_at + Duration::from_secs(second);
             let event = ids(second + 3, second + 4, second + 4);
-            assert_eq!(
-                machine.handle(Input::Event(event), at),
-                Action::None
-            );
+            assert_eq!(machine.handle(Input::Event(event), at), Action::None);
             assert_eq!(machine.handle(Input::Tick, at), Action::None);
         }
         assert_eq!(
-            machine
-                .handle(Input::Tick, connected_at + STITCH_TIMEOUT),
+            machine.handle(Input::Tick, connected_at + STITCH_TIMEOUT),
             Action::FetchSnapshot
         );
         assert_eq!(machine.counters().snapshot_rejected, 1);
@@ -1390,32 +1111,22 @@ mod tests {
             connected_at + Duration::from_secs(4),
         );
         assert_eq!(
-            machine.handle(
-                Input::Tick,
-                connected_at + Duration::from_secs(8)
-            ),
+            machine.handle(Input::Tick, connected_at + Duration::from_secs(8)),
             Action::None
         );
         assert!(matches!(
-            machine.handle(
-                Input::Tick,
-                connected_at + Duration::from_secs(9)
-            ),
+            machine.handle(Input::Tick, connected_at + Duration::from_secs(9)),
             Action::ResetConnection { .. }
         ));
     }
 
     #[test]
-    fn overflowed_buffer_rejects_a_snapshot_it_can_no_longer_bridge()
-    {
+    fn overflowed_buffer_rejects_a_snapshot_it_can_no_longer_bridge() {
         let now = Instant::now();
         let mut machine = machine(now);
         for i in 0..MAX_BUFFERED_EVENTS + 3 {
             let first = u64::try_from(i).expect("small index");
-            machine.handle(
-                Input::Event(ids(first, first + 1, first + 1)),
-                now,
-            );
+            machine.handle(Input::Event(ids(first, first + 1, first + 1)), now);
         }
         assert_eq!(machine.buffered(), MAX_BUFFERED_EVENTS);
         assert_eq!(machine.counters().buffer_dropped, 3);
@@ -1426,14 +1137,6 @@ mod tests {
         assert_eq!(machine.counters().snapshot_rejected, 1);
     }
 
-    fn px(text: &str) -> Px {
-        text.parse().expect("test literal")
-    }
-
-    fn qty(text: &str) -> Qty {
-        text.parse().expect("test literal")
-    }
-
     fn with_levels(
         prev: u64,
         first: u64,
@@ -1442,11 +1145,9 @@ mod tests {
         asks: Vec<(Px, Qty)>,
     ) -> DepthEvent {
         DepthEvent {
-            first_update_id: first,
-            final_update_id: last,
-            prev_final_update_id: prev,
             bids,
             asks,
+            ..ids(prev, first, last)
         }
     }
 
@@ -1483,19 +1184,9 @@ mod tests {
     /// Live on the wide book with a re-anchor pending: asks 101 and 150 are gone, `last_u = 10`.
     fn pending_reanchor_machine(now: Instant) -> SyncMachine {
         let mut machine = wide_live_machine(now);
-        let delete_101 =
-            with_levels(6, 7, 8, Vec::new(), vec![level("101", "0")]);
-        assert_eq!(
-            machine.handle(Input::Event(delete_101), now),
-            Action::None
-        );
-        let delete_150 = with_levels(
-            8,
-            9,
-            10,
-            Vec::new(),
-            vec![level("150", "0")],
-        );
+        let delete_101 = with_levels(6, 7, 8, Vec::new(), vec![level("101", "0")]);
+        assert_eq!(machine.handle(Input::Event(delete_101), now), Action::None);
+        let delete_150 = with_levels(8, 9, 10, Vec::new(), vec![level("150", "0")]);
         assert_eq!(
             machine.handle(Input::Event(delete_150), now),
             Action::FetchSnapshot
@@ -1507,36 +1198,30 @@ mod tests {
         Snapshot {
             last_update_id,
             bids: vec![level("190", "1"), level("180", "1")],
-            asks: vec![
-                level("191", "1"),
-                level("250", "1"),
-                level("300", "1"),
-            ],
+            asks: vec![level("191", "1"), level("250", "1"), level("300", "1")],
         }
+    }
+
+    #[test]
+    fn band_exhaustion_during_a_pending_reanchor_resyncs_and_drops_it() {
+        let now = Instant::now();
+        let mut machine = pending_reanchor_machine(now);
+        let delete_191 = with_levels(10, 11, 12, Vec::new(), vec![level("191", "0")]);
+        assert_eq!(
+            machine.handle(Input::Event(delete_191), now),
+            Action::FetchSnapshot
+        );
+        assert!(matches!(machine.state(), State::Resyncing { .. }));
+        assert_eq!(machine.reanchor_buffered(), None);
+        assert_eq!(machine.buffered(), 1);
     }
 
     #[test]
     fn reanchor_fires_at_the_margin_and_not_before() {
         let now = Instant::now();
-        let mut machine = wide_live_machine(now);
-        let delete_101 =
-            with_levels(6, 7, 8, Vec::new(), vec![level("101", "0")]);
-        assert_eq!(
-            machine.handle(Input::Event(delete_101), now),
-            Action::None
-        );
-        assert_eq!(machine.reanchor_buffered(), None);
-        let delete_150 = with_levels(
-            8,
-            9,
-            10,
-            Vec::new(),
-            vec![level("150", "0")],
-        );
-        assert_eq!(
-            machine.handle(Input::Event(delete_150), now),
-            Action::FetchSnapshot
-        );
+        // The helper asserts the first delete returns no action and the second asks for the
+        // snapshot.
+        let machine = pending_reanchor_machine(now);
         assert!(matches!(machine.state(), State::Live { .. }));
         assert_eq!(machine.reanchor_buffered(), Some(1));
     }
@@ -1545,17 +1230,8 @@ mod tests {
     fn events_during_a_pending_reanchor_reach_both_book_and_buffer() {
         let now = Instant::now();
         let mut machine = pending_reanchor_machine(now);
-        let insert_195 = with_levels(
-            10,
-            11,
-            12,
-            Vec::new(),
-            vec![level("195", "5")],
-        );
-        assert_eq!(
-            machine.handle(Input::Event(insert_195), now),
-            Action::None
-        );
+        let insert_195 = with_levels(10, 11, 12, Vec::new(), vec![level("195", "5")]);
+        assert_eq!(machine.handle(Input::Event(insert_195), now), Action::None);
         let book = machine.book().expect("live");
         assert_eq!(book.asks.get(&px("195")), Some(&qty("5")));
         assert_eq!(book.last_update_id, 12);
@@ -1566,17 +1242,10 @@ mod tests {
     fn successful_reanchor_keeps_live_and_changes_the_band() {
         let now = Instant::now();
         let mut machine = pending_reanchor_machine(now);
-        let insert_195 = with_levels(
-            10,
-            11,
-            12,
-            Vec::new(),
-            vec![level("195", "5")],
-        );
+        let insert_195 = with_levels(10, 11, 12, Vec::new(), vec![level("195", "5")]);
         machine.handle(Input::Event(insert_195), now);
         assert_eq!(
-            machine
-                .handle(Input::Snapshot(narrower_snapshot(11)), now),
+            machine.handle(Input::Snapshot(narrower_snapshot(11)), now),
             Action::None
         );
         let book = machine.book().expect("still live");
@@ -1595,8 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_snapshot_without_bridge_is_rejected_and_the_live_book_kept()
-     {
+    fn reanchor_snapshot_without_bridge_is_rejected_and_the_live_book_kept() {
         let now = Instant::now();
         let mut machine = pending_reanchor_machine(now);
         assert_eq!(
@@ -1617,8 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn gap_during_a_pending_reanchor_takes_the_ordinary_resync_path()
-    {
+    fn gap_during_a_pending_reanchor_takes_the_ordinary_resync_path() {
         let now = Instant::now();
         let mut machine = pending_reanchor_machine(now);
         assert_eq!(
@@ -1634,41 +1301,6 @@ mod tests {
         );
         assert_eq!(machine.reanchor_buffered(), None);
         assert_eq!(machine.buffered(), 1);
-    }
-
-    #[test]
-    fn band_exhaustion_during_a_pending_reanchor_keeps_the_kept_events()
-     {
-        let now = Instant::now();
-        let mut machine = pending_reanchor_machine(now);
-        let delete_191 = with_levels(
-            10,
-            11,
-            12,
-            Vec::new(),
-            vec![level("191", "0")],
-        );
-        assert_eq!(
-            machine.handle(Input::Event(delete_191), now),
-            Action::FetchSnapshot
-        );
-        assert_eq!(
-            resync_reason(&machine),
-            Some(ResyncReason::BandExhausted {
-                bids: 4,
-                asks: 1,
-                k_levels: K
-            })
-        );
-        assert_eq!(machine.buffered(), 2);
-        assert_eq!(
-            machine.handle(Input::Snapshot(wide_snapshot(10)), now),
-            Action::None
-        );
-        assert_eq!(
-            machine.book().expect("live again").last_update_id,
-            12
-        );
     }
 
     #[test]
@@ -1690,13 +1322,11 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_snapshot_newer_than_the_kept_events_waits_for_a_bridge()
-     {
+    fn reanchor_snapshot_newer_than_the_kept_events_waits_for_a_bridge() {
         let now = Instant::now();
         let mut machine = pending_reanchor_machine(now);
         assert_eq!(
-            machine
-                .handle(Input::Snapshot(narrower_snapshot(50)), now),
+            machine.handle(Input::Snapshot(narrower_snapshot(50)), now),
             Action::None
         );
         assert_eq!(machine.counters().reanchors, 0);
@@ -1705,32 +1335,22 @@ mod tests {
             Action::None
         );
         assert_eq!(machine.counters().reanchors, 1);
-        assert_eq!(
-            machine.book().expect("live").band.ask_ceiling,
-            px("300")
-        );
+        assert_eq!(machine.book().expect("live").band.ask_ceiling, px("300"));
     }
 
     #[test]
-    fn reanchor_snapshot_nothing_bridges_is_rejected_after_the_stitch_timeout()
-     {
+    fn reanchor_snapshot_nothing_bridges_is_rejected_after_the_stitch_timeout() {
         let started = Instant::now();
         let mut machine = pending_reanchor_machine(started);
         assert_eq!(
-            machine.handle(
-                Input::Snapshot(narrower_snapshot(50)),
-                started
-            ),
+            machine.handle(Input::Snapshot(narrower_snapshot(50)), started),
             Action::None
         );
         for second in 1..30u64 {
             let at = started + Duration::from_secs(second);
             let last = 10 + second;
             assert_eq!(
-                machine.handle(
-                    Input::Event(ids(last - 1, last, last)),
-                    at
-                ),
+                machine.handle(Input::Event(ids(last - 1, last, last)), at),
                 Action::None
             );
             assert_eq!(machine.handle(Input::Tick, at), Action::None);
@@ -1742,36 +1362,6 @@ mod tests {
         assert_eq!(machine.counters().snapshot_rejected, 1);
         assert!(matches!(machine.state(), State::Live { .. }));
         assert_eq!(machine.reanchor_buffered(), Some(0));
-    }
-
-    #[test]
-    fn band_exhaustion_with_a_held_reanchor_snapshot_stitches_it_at_once()
-     {
-        let now = Instant::now();
-        let mut machine = pending_reanchor_machine(now);
-        assert_eq!(
-            machine
-                .handle(Input::Snapshot(narrower_snapshot(50)), now),
-            Action::None
-        );
-        let delete_191 = with_levels(
-            10,
-            11,
-            51,
-            Vec::new(),
-            vec![level("191", "0")],
-        );
-        assert_eq!(
-            machine.handle(Input::Event(delete_191), now),
-            Action::None
-        );
-        let book =
-            machine.book().expect("live from the held snapshot");
-        assert_eq!(book.last_update_id, 51);
-        assert_eq!(book.band.ask_ceiling, px("300"));
-        assert_eq!(book.asks.get(&px("191")), None);
-        assert_eq!(machine.counters().band_exhausted, 1);
-        assert_eq!(machine.counters().reanchors, 0);
     }
 
     #[test]

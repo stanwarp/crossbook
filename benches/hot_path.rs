@@ -3,9 +3,9 @@ use std::time::Instant;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use crossbook::book::{Book, DepthEvent, Snapshot};
-use crossbook::protocol::Envelope;
 use crossbook::store::book_store;
 use crossbook::view::{BookView, NotLiveReason};
+use crossbook::wire::Envelope;
 
 // The frame and the snapshot were captured together, 8 s apart, so 42 of the frame's 58 levels
 // fall inside the book's band. Re-record them as a pair, or the apply benchmark measures nothing.
