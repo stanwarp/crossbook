@@ -12,17 +12,37 @@ pedantic = { level = "warn" }
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false }
 rand = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
-# The WebSocket TLS needs a rustls crypto provider; tokio-tungstenite enables none itself, and
-# the socket must not depend on reqwest's features for it.
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "http2",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "aws-lc-rs",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "net",
+  "signal",
+  "io-util",
+  "io-std",
+] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "hot_path"
+harness = false
